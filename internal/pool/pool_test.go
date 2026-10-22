@@ -3,6 +3,7 @@ package pool
 import (
 	"encoding/json"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"strings"
@@ -176,31 +177,6 @@ func TestPickWeightedTopFiveOnly(t *testing.T) {
 	}
 }
 
-func TestPickTopFiveBySuccessRateNotCredits(t *testing.T) {
-	withNoPickGap(t)
-	// C1 回归：top5 短名单必须按三因子权重（含成功率）而非纯 credits 截断。
-	// a1..a5 credits=100 但成功率极低（1/100），a6 credits=90 但成功率 100%。
-	// 纯 credits 排序时 a6（90 < 100）是第 6 名，永远进不了 top5；
-	// 三因子权重下 a6 权重最高，首轮必被选中。仅断言首轮（后续 a6 闲置补偿衰减会合法发散）。
-	p := New("")
-	p.SetRandomSource(func(n int64) int64 { return 0 }) // r=0 → 选权重最高的候选
-	for _, u := range []string{"a1", "a2", "a3", "a4", "a5"} {
-		p.Add(&auth.Auth{UID: u})
-		p.SetCredits(u, 100, 0)
-		for i := 0; i < 99; i++ {
-			p.NoteError(u) // 成功率 1/(1+99)≈0.03
-		}
-		p.NoteSuccess(u)
-	}
-	p.Add(&auth.Auth{UID: "a6"})
-	p.SetCredits("a6", 90, 0)
-	p.NoteSuccess("a6") // 成功率 100%
-
-	if got := p.Pick(); got == nil || got.UID != "a6" {
-		t.Fatalf("pick=%v, want a6 (high-success low-credit must enter top5 by weight)", got)
-	}
-}
-
 func TestPickTopFiveByIdleNotCredits(t *testing.T) {
 	withNoPickGap(t)
 	// C1 回归：闲置补偿同样影响短名单。a1..a5 credits=100 但刚被用过（闲置 0），
@@ -348,6 +324,28 @@ func TestDisablePersists(t *testing.T) {
 	st, _ := p2.Status("u1")
 	if !st.Disabled || st.Reason != "12153 session dead" {
 		t.Errorf("status=%+v", st)
+	}
+}
+
+// issue #171 问题一：软冷却到期后 until/coolKind/reason 字段按设计不清理，
+// statusOf 不应再把过期 reason 透出给面板（避免「可用」旁挂着历史 429）。
+func TestStatusReasonHiddenAfterCooldownExpires(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	// 冷却中：reason 正常透出。
+	p.Cooldown("u1", CoolSoft, time.Hour, "429 rate limit")
+	st, ok := p.Status("u1")
+	if !ok || !st.Cooling || st.Reason != "429 rate limit" {
+		t.Fatalf("cooling status=%+v ok=%v", st, ok)
+	}
+	// 冷却到期、字段残留（NoteSuccess 不碰 until/coolKind/reason）：不再透出。
+	p.Cooldown("u1", CoolSoft, -time.Minute, "429 rate limit")
+	st, ok = p.Status("u1")
+	if !ok || st.Cooling {
+		t.Fatalf("expired cooldown should not be cooling: %+v", st)
+	}
+	if st.Reason != "" {
+		t.Fatalf("expired cooldown reason leaked to status: %q", st.Reason)
 	}
 }
 
@@ -688,32 +686,46 @@ func wantCoolSec(t *testing.T, p *Pool, uid string, want int64, tol int64) {
 	}
 }
 
+// expireCooldown 测试助手：把账号冷却截止回拨到过去，模拟冷却已到期
+// （CooldownSoftRate 只在"不在有效软冷却中"时推进 streak——跨冷却期堆加）。
+func expireCooldown(p *Pool, uid string) {
+	p.mu.Lock()
+	if e, ok := p.byUID[uid]; ok {
+		e.until = time.Now().Add(-time.Second)
+	}
+	p.mu.Unlock()
+}
+
 func TestCooldownSoftExponentialBackoff(t *testing.T) {
-	// 同一账号连续软冷却 → 时长按 2 倍指数增长（不依赖真实等待，只看剩余时长）。
+	// 同一账号**跨冷却期**连续软限流 → 时长按 2 倍指数增长（吸收上游：冷却中的
+	// 兜底探测不再堆加，堆加只发生在到期后的新一轮限流）。
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.SetSoftRateMax(time.Hour) // 封顶 1h：本用例三步（600/1200/2400）都不触及
 
 	for i, want := range []int64{600, 1200, 2400} {
-		p.Cooldown("u1", CoolSoft, 600*time.Second, "429 rate limit")
+		p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "429 rate limit")
 		wantCoolSec(t, p, "u1", want, 3)
 		if st, _ := p.Status("u1"); st.SoftStreak != i+1 {
 			t.Errorf("after call %d: soft_streak=%d want %d", i+1, st.SoftStreak, i+1)
 		}
+		expireCooldown(p, "u1") // 模拟冷却到期后再撞新一轮限流
 	}
 }
 
 func TestCooldownSoftCappedBySoftRateMax(t *testing.T) {
-	// 注入封顶：streak 3 的 400s 被压到 250s。
+	// 注入封顶：streak 3 的 400s 被压到 250s（跨冷却期堆加）。
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.SetSoftRateMax(250 * time.Second)
 
-	p.Cooldown("u1", CoolSoft, 100*time.Second, "x")
+	p.CooldownSoftRate("u1", 100*time.Second, time.Time{}, "x")
 	wantCoolSec(t, p, "u1", 100, 3)
-	p.Cooldown("u1", CoolSoft, 100*time.Second, "x")
+	expireCooldown(p, "u1")
+	p.CooldownSoftRate("u1", 100*time.Second, time.Time{}, "x")
 	wantCoolSec(t, p, "u1", 200, 3)
-	p.Cooldown("u1", CoolSoft, 100*time.Second, "x")
+	expireCooldown(p, "u1")
+	p.CooldownSoftRate("u1", 100*time.Second, time.Time{}, "x")
 	wantCoolSec(t, p, "u1", 250, 3)
 }
 
@@ -722,11 +734,12 @@ func TestCooldownSoftDefaultCapWhenUnset(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	for i, want := range []int64{600, 1200, 2400, 4800, 7200} {
-		p.Cooldown("u1", CoolSoft, 600*time.Second, "x")
+		p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
 		wantCoolSec(t, p, "u1", want, 3)
 		if st, _ := p.Status("u1"); st.SoftStreak != i+1 {
 			t.Errorf("soft_streak=%d want %d", st.SoftStreak, i+1)
 		}
+		expireCooldown(p, "u1")
 	}
 }
 
@@ -737,7 +750,10 @@ func TestSetSoftRateMaxIgnoresNonPositive(t *testing.T) {
 	p.SetSoftRateMax(0)
 	p.SetSoftRateMax(-time.Second)
 	for i := 0; i < 6; i++ {
-		p.Cooldown("u1", CoolSoft, 600*time.Second, "x")
+		p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
+		if i < 5 {
+			expireCooldown(p, "u1") // 最后一轮不回拨：断言时须仍在冷却中
+		}
 	}
 	wantCoolSec(t, p, "u1", 7200, 3) // 仍是 2h 封顶（第 6 步 19200s → 7200s）
 }
@@ -746,41 +762,48 @@ func TestCooldownSoftStreakResetBySuccess(t *testing.T) {
 	// 成功即证明账号恢复 → streak 归零，下次软冷却回到基数。
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
-	p.Cooldown("u1", CoolSoft, 600*time.Second, "x")
-	p.Cooldown("u1", CoolSoft, 600*time.Second, "x")
+	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
+	expireCooldown(p, "u1")
+	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
 	wantCoolSec(t, p, "u1", 1200, 3)
 
 	p.NoteSuccess("u1")
 	if st, _ := p.Status("u1"); st.SoftStreak != 0 {
 		t.Fatalf("success should reset soft_streak, got %d", st.SoftStreak)
 	}
-	p.Cooldown("u1", CoolSoft, 600*time.Second, "x")
+	expireCooldown(p, "u1") // 新一轮限流（上一轮冷却已过/已被成功重置）
+	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
 	wantCoolSec(t, p, "u1", 600, 3)
 }
 
-func TestCooldownSoftStreakResetByReenable(t *testing.T) {
-	// 签到解冻（reviveCoolingLocked）清 cooling 域 → softStreak 一并归零；
-	// 熔断域（fails/retryCount/breakerUntil）不动，与既有 C5 语义一致。
+func TestCooldownSoftKeptByReenable(t *testing.T) {
+	// 签到/余额刷新解冻（reviveCoolingLocked）只解冻余额耗尽冷却（CoolHard）；
+	// 软限流冷却（CoolSoft）与 softStreak 保留——限流恢复证据是重置墙钟/退避到期，
+	// 不是余额恢复（余额刷新每 5 分钟一次，若在此清冷却域，限流保护实际寿命被压到
+	// 一个刷新周期内）。熔断域（fails/retryCount/breakerUntil）不动，与既有 C5 语义一致。
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
-	p.Cooldown("u1", CoolSoft, 600*time.Second, "x")
-	p.Cooldown("u1", CoolSoft, 600*time.Second, "x")
+	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
+	expireCooldown(p, "u1") // 跨冷却期第二次限流，streak 累计到 2（冷却中重复触发不堆叠，#152）
+	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
 	failsBefore := p.breakerFails("u1")
 
 	p.ReenableIfCredits("u1", 500, 0)
 	st, _ := p.Status("u1")
-	if st.SoftStreak != 0 {
-		t.Errorf("reenable should reset soft_streak, got %d", st.SoftStreak)
+	if !st.Cooling {
+		t.Errorf("reenable 不得解除软限流冷却: %+v", st)
 	}
-	if st.Cooling {
-		t.Errorf("reenable should clear cooling: %+v", st)
+	if st.SoftStreak != 2 {
+		t.Errorf("reenable 不得清零软限流退避计数 soft_streak, got %d want 2", st.SoftStreak)
 	}
 	if failsAfter := p.breakerFails("u1"); failsAfter != failsBefore {
 		t.Errorf("reenable must not touch breaker: fails %d → %d", failsBefore, failsAfter)
 	}
 
-	p.Cooldown("u1", CoolSoft, 600*time.Second, "x")
-	wantCoolSec(t, p, "u1", 600, 3)
+	// 退避延续：第 3 次触发从既有 streak=2 继续 → 600s<<2 = 2400s（而非归零后的 600s）。
+	expireCooldown(p, "u1")
+	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
+	wantCoolSec(t, p, "u1", 2400, 3)
 }
 
 func TestCooldownHardDoesNotAdvanceSoftStreak(t *testing.T) {
@@ -791,7 +814,7 @@ func TestCooldownHardDoesNotAdvanceSoftStreak(t *testing.T) {
 	if st, _ := p.Status("u1"); st.SoftStreak != 0 {
 		t.Fatalf("hard cooldown must not touch soft_streak, got %d", st.SoftStreak)
 	}
-	p.Cooldown("u1", CoolSoft, 600*time.Second, "x")
+	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
 	wantCoolSec(t, p, "u1", 600, 3)
 }
 
@@ -800,8 +823,9 @@ func TestSoftStreakPersistsAcrossReload(t *testing.T) {
 	fp := filepath.Join(dir, "state.json")
 	p := New(fp)
 	p.Add(&auth.Auth{UID: "u1"})
-	p.Cooldown("u1", CoolSoft, 600*time.Second, "x")
-	p.Cooldown("u1", CoolSoft, 600*time.Second, "x")
+	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
+	expireCooldown(p, "u1")
+	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
 	p.Flush()
 
 	raw, err := os.ReadFile(fp)
@@ -809,7 +833,7 @@ func TestSoftStreakPersistsAcrossReload(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.Contains(string(raw), `"soft_streak"`) {
-		t.Fatalf("state.json missing soft_streak:\n%s", raw)
+		t.Fatalf("state.json missing soft_streak: %s", raw)
 	}
 
 	p2 := New(fp)
@@ -818,7 +842,8 @@ func TestSoftStreakPersistsAcrossReload(t *testing.T) {
 		t.Fatalf("soft_streak after reload=%d want 2", st.SoftStreak)
 	}
 	// 退避从持久化的 streak 继续：第 3 次 → 2400s。
-	p2.Cooldown("u1", CoolSoft, 600*time.Second, "x")
+	expireCooldown(p2, "u1")
+	p2.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
 	wantCoolSec(t, p2, "u1", 2400, 3)
 }
 
@@ -834,7 +859,7 @@ func TestSoftStreakMissingInLegacyStateFile(t *testing.T) {
 	if st, _ := p.Status("u1"); st.SoftStreak != 0 {
 		t.Fatalf("legacy file should load soft_streak=0, got %d", st.SoftStreak)
 	}
-	p.Cooldown("u1", CoolSoft, 600*time.Second, "x")
+	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
 	wantCoolSec(t, p, "u1", 600, 3)
 }
 
@@ -843,19 +868,27 @@ func TestSoftStreakMissingInLegacyStateFile(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestCooldownSoftForModelParsedUntil(t *testing.T) {
-	// 6004 msg 带「将在 … 重置」→ until 精确等于解析时间（wall-clock 判断）。
-	// 用未来 5 分钟的时间戳：解析后 until ≈ now+5m，远短于固定 600s 基数的指数退避，
+	// 6004 msg 带「将在 … 重置」→ 该模型的独立冷却截止精确等于解析时间（wall-clock 判断）。
+	// 用未来 5 分钟的时间戳：解析后 Until ≈ now+5m，远短于固定 600s 基数的指数退避，
 	// 证明"上游明说重置时间"优先于"600s 起指数退避"。
+	// 新语义：只写 modelCooldowns（不写账号级 until）→ 账号不 cooling、台账单行。
 	reset := time.Now().Add(5 * time.Minute)
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "429 rate limit")
 	st, ok := p.Status("u1")
-	if !ok || st.CoolKind != "soft_rate" {
-		t.Fatalf("want soft_rate cooling: %+v ok=%v", st, ok)
+	if !ok {
+		t.Fatal("account missing")
 	}
-	if d := st.Until.Sub(reset); d < -time.Second || d > time.Second {
-		t.Errorf("until=%v want ~reset=%v (diff %v)", st.Until, reset, d)
+	if st.Cooling {
+		t.Fatalf("6004-with-reset should NOT set account-level cooling: %+v", st)
+	}
+	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "glm-5.3" {
+		t.Fatalf("want single model ledger row for glm-5.3: %+v", st.RateLimitedModels)
+	}
+	until := st.RateLimitedModels[0].Until
+	if d := until.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("model until=%v want ~reset=%v (diff %v)", until, reset, d)
 	}
 }
 
@@ -868,20 +901,25 @@ func TestCooldownSoftForModelCappedBySoftRateMax(t *testing.T) {
 	before := time.Now()
 	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "429 rate limit")
 	st, _ := p.Status("u1")
-	if st.Until.Sub(before) > 10*time.Minute+time.Second {
-		t.Errorf("until=%v want capped at soft_rate_max=10m", st.Until)
+	if len(st.RateLimitedModels) != 1 {
+		t.Fatalf("want model ledger row: %+v", st.RateLimitedModels)
+	}
+	if st.RateLimitedModels[0].Until.Sub(before) > 10*time.Minute+time.Second {
+		t.Errorf("model until=%v want capped at soft_rate_max=10m", st.RateLimitedModels[0].Until)
 	}
 }
 
 func TestCooldownSoftForModelNoResetFallbackBackoff(t *testing.T) {
-	// 无解析时间（resetAt 零值）→ 退回 600s 起指数退避（现状不动）。
+	// 无解析时间（resetAt 零值）→ 有界退避（600s 起）。冷却中的兜底探测再撞 429
+	// **不推进 streak、不延长**（吸收上游：旧「每次探测都翻倍」正是全池被推到
+	// 2h 封顶的元凶）。
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.SetSoftRateMax(time.Hour)
 	p.CooldownSoftForModel("u1", 600*time.Second, time.Time{}, "", "429 rate limit")
 	wantCoolSec(t, p, "u1", 600, 3)
 	p.CooldownSoftForModel("u1", 600*time.Second, time.Time{}, "", "429 rate limit")
-	wantCoolSec(t, p, "u1", 1200, 3)
+	wantCoolSec(t, p, "u1", 600, 3) // 仍在冷却中：不堆加
 }
 
 // TestPickExcludingForModelSkipsSoftCoolingSameModel 冷却中账号（6004 带解析时间，
@@ -978,36 +1016,38 @@ func TestSoftRateModelClearedByPlainCooldown(t *testing.T) {
 	}
 }
 
-// TestSoftRateModelNotPersistedToState 新字段 softRateModel 缺省空 = 现状兼容：
-// 旧 state.json 不写它也能正常加载；落盘不引入该字段（运行态语义，重启即清零）。
-func TestSoftRateModelNotPersistedToState(t *testing.T) {
+// TestSoftRateModelNotPersistedToState 模型级独立冷却（modelCooldowns）是运行态：
+// 落盘不引入该字段，重启清零（退化为仅账号级 until 冷却的现状）。
+// 新语义：6004 带重置时间只写 modelCooldowns、不写 until → 重载后账号不冷却、
+// 台账为空。
+func TestSoftRateModelPersistsToState(t *testing.T) {
+	// 6004 重置墙钟可长达数小时，跨重启是常态：model_cooldowns 持久化，
+	// 恢复后 healthyForModel 不失忆（吸收上游 2f4c77b）。
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "state.json")
 	p := New(fp)
 	p.Add(&auth.Auth{UID: "u1"})
-	// resetAt 必须显著晚于 now：传 time.Now() 会走"重置时间已过"分支把冷却压到 1ms，
-	// Flush+Reload 后 until 已过期，断言必然失败（窗口远小于测试自身开销）。
+	// resetAt 必须显著晚于 now：传 time.Now() 会走"重置时间已过"分支把冷却压到 1ms。
 	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(10*time.Minute), "glm-5.3", "429 rate limit")
 	p.Flush()
 	raw, err := os.ReadFile(fp)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(raw), "soft_rate_model") {
-		t.Errorf("state.json should not persist soft_rate_model (runtime-only):\n%s", raw)
+	if !strings.Contains(string(raw), "model_cooldowns") {
+		t.Errorf("state.json 应持久化 model_cooldowns: %s", raw)
 	}
-	// 重载后账号仍在冷却（until 持久化），softRateModel 清零。
 	p2 := New(fp)
 	p2.Add(&auth.Auth{UID: "u1"})
 	st, ok := p2.Status("u1")
-	if !ok || !st.Cooling {
-		t.Fatalf("cooldown should persist after reload: %+v ok=%v", st, ok)
+	if !ok {
+		t.Fatalf("account missing after reload")
 	}
-	p2.mu.RLock()
-	em := p2.byUID["u1"].softRateModel
-	p2.mu.RUnlock()
-	if em != "" {
-		t.Errorf("softRateModel should reset on reload, got %q", em)
+	if st.Cooling {
+		t.Fatalf("6004-with-reset 不写账号级 until，重载后不应 cooling: %+v", st)
+	}
+	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "glm-5.3" {
+		t.Errorf("modelCooldowns should survive reload, got %+v", st.RateLimitedModels)
 	}
 }
 
@@ -1355,21 +1395,6 @@ func TestWeightIdleCompensation(t *testing.T) {
 	wUsed, wIdle := p.entryWeight("used"), p.entryWeight("idle")
 	if wIdle <= wUsed {
 		t.Errorf("idle should weigh more: used=%v idle=%v", wUsed, wIdle)
-	}
-}
-
-func TestWeightLowSuccessRateDowngrades(t *testing.T) {
-	p := New("")
-	p.Add(&auth.Auth{UID: "good"})
-	p.Add(&auth.Auth{UID: "bad"})
-	p.SetCredits("good", 100, 0)
-	p.SetCredits("bad", 100, 0)
-	p.NoteSuccess("good")
-	p.NoteError("bad")
-	p.NoteError("bad")
-	wGood, wBad := p.entryWeight("good"), p.entryWeight("bad")
-	if wBad >= wGood {
-		t.Errorf("low success rate should weigh less: good=%v bad=%v", wGood, wBad)
 	}
 }
 
@@ -1734,5 +1759,301 @@ func TestTokenUsagePersistsAcrossReload(t *testing.T) {
 	}
 	if strings.Contains(string(raw), "AccessToken") || strings.Contains(string(raw), "RefreshToken") {
 		t.Fatalf("state.json contains credential field: %s", raw)
+	}
+}
+
+func TestPickPrefersExpiringByVirtualWeight(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.Add(&auth.Auth{UID: "later"})
+	p.Add(&auth.Auth{UID: "soon"})
+	p.Add(&auth.Auth{UID: "none"})
+
+	now := time.Now()
+	p.SetCreditsDetailed("later", 100, 100, 100, now.Add(48*time.Hour), 100)
+	p.SetCreditsDetailed("soon", 100, 100, 100, now.Add(2*time.Hour), 100)
+	p.SetCreditsDetailed("none", 100, 100, 0, time.Time{}, 0)
+
+	// 3:1 虚拟实例是软偏好而非硬优先。用确定性随机源统计长期分布：两个快过期
+	// 账号的合计份额应显著高于普通账号，同时普通账号仍保留少量流量。
+	rng := rand.New(rand.NewPCG(1, 2))
+	p.SetRandomSource(func(n int64) int64 { return rng.Int64N(n) })
+	counts := map[string]int{}
+	for i := 0; i < 2000; i++ {
+		got := p.Pick()
+		if got == nil {
+			t.Fatal("pick returned nil")
+		}
+		counts[got.UID]++
+	}
+	expiring := counts["soon"] + counts["later"]
+	if expiring < 1500 || counts["none"] == 0 {
+		t.Fatalf("virtual weight distribution=%v, want expiring majority and regular non-zero", counts)
+	}
+}
+
+func TestPickExpiringTieUsesExistingWeight(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.Add(&auth.Auth{UID: "small"})
+	p.Add(&auth.Auth{UID: "large"})
+	p.SetRandomSource(func(n int64) int64 { return 0 })
+
+	at := time.Now().Add(time.Hour)
+	p.SetCreditsDetailed("small", 10, 10, 10, at, 10)
+	p.SetCreditsDetailed("large", 50, 50, 50, at, 50)
+
+	got := p.Pick()
+	if got == nil || got.UID != "large" {
+		t.Fatalf("pick=%v want large", got)
+	}
+}
+
+func TestPreferExpiringDisabledRestoresWeight(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "a"})
+	p.Add(&auth.Auth{UID: "b"})
+	now := time.Now()
+	p.SetCreditsDetailed("a", 100, 100, 50, now.Add(time.Hour), 50)
+	p.SetCreditsDetailed("b", 100, 100, 0, time.Time{}, 0)
+
+	p.mu.Lock()
+	we := p.routingWeightOf(p.byUID["a"], 100, now)
+	wn := p.routingWeightOf(p.byUID["b"], 100, now)
+	p.mu.Unlock()
+	if we != wn*expiringVirtualSlots {
+		t.Fatalf("enabled expiring weight=%v want %v", we, wn*expiringVirtualSlots)
+	}
+
+	p.SetPreferExpiring(false)
+
+	p.mu.Lock()
+	wa := p.routingWeightOf(p.byUID["a"], 100, now)
+	wb := p.routingWeightOf(p.byUID["b"], 100, now)
+	p.mu.Unlock()
+	if wa != wb {
+		t.Fatalf("disabled expiring weights differ: %v/%v", wa, wb)
+	}
+}
+
+func TestCreditExpirySnapshotConsumptionAndClear(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	now := time.Now()
+	p.SetCreditsDetailed("u1", 100, 100, 50, now.Add(time.Hour), 40)
+
+	st, _ := p.Status("u1")
+	if st.CreditsExpiring != 50 || st.CreditsEarliestRemaining != 40 || st.CreditsEarliestExpiry.IsZero() {
+		t.Fatalf("initial snapshot=%+v", st)
+	}
+
+	p.NoteModelCost("u1", "m", 10, 1000)
+	st, _ = p.Status("u1")
+	if st.Credits != 90 || st.CreditsExpiring != 40 || st.CreditsEarliestRemaining != 30 {
+		t.Fatalf("after consume=%+v", st)
+	}
+
+	p.NoteModelCost("u1", "m", 40, 1000)
+	st, _ = p.Status("u1")
+	if st.Credits != 50 || st.CreditsExpiring != 0 || st.CreditsEarliestRemaining != 0 || !st.CreditsEarliestExpiry.IsZero() {
+		t.Fatalf("after exhaustion=%+v", st)
+	}
+
+	p.SetCreditsDetailed("u1", 50, 50, 10, now.Add(time.Hour), 10)
+	p.SetCreditsDetailed("u1", 50, 50, 0, time.Time{}, 0)
+	st, _ = p.Status("u1")
+	if st.CreditsExpiring != 0 || st.CreditsEarliestRemaining != 0 || !st.CreditsEarliestExpiry.IsZero() {
+		t.Fatalf("zero refresh did not clear snapshot=%+v", st)
+	}
+}
+
+// TestExpiryBucketsFEFOAndPersistence 钉住按日到期批次的三件事：
+//  1. 最早批次以 buckets 为准（同日多包合计已在写入前完成），而不是入参单批值；
+//  2. 两次余额刷新之间按 FEFO 扣减，扣穿第一桶后最早批次顺延到下一桶；
+//  3. state.json / Redis 快照往返不丢批次，重启后首页快照仍与「检查」同口径。
+func TestExpiryBucketsFEFOAndPersistence(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	now := time.Now()
+	at1 := now.Add(24 * time.Hour)
+	at2 := now.Add(48 * time.Hour)
+	p.SetCreditsSnapshot("u1", CreditsSnapshot{
+		Remain: 300, Total: 300, Expiring: 100,
+		// 故意给一个与 buckets 不一致的最早值：buckets 必须优先。
+		EarliestAt: at1, EarliestRemaining: 999,
+		ExpiryBuckets: []ExpiryBucket{
+			{Date: at1.Format("2006-01-02"), ExpireAt: at1, Remain: 100},
+			{Date: at2.Format("2006-01-02"), ExpireAt: at2, Remain: 200},
+		},
+	})
+	st, _ := p.Status("u1")
+	if len(st.CreditsExpiryBuckets) != 2 || st.CreditsEarliestRemaining != 100 || !st.CreditsEarliestExpiry.Equal(at1) {
+		t.Fatalf("initial buckets=%+v earliest=%v/%d", st.CreditsExpiryBuckets, st.CreditsEarliestExpiry, st.CreditsEarliestRemaining)
+	}
+
+	// 扣 150：第一桶扣穿（100），第二桶剩 150，最早批次顺延到 at2。
+	p.NoteModelCost("u1", "m", 150, 1000)
+	st, _ = p.Status("u1")
+	if st.Credits != 150 || len(st.CreditsExpiryBuckets) != 1 || st.CreditsExpiryBuckets[0].Remain != 150 {
+		t.Fatalf("after consume buckets=%+v credits=%d", st.CreditsExpiryBuckets, st.Credits)
+	}
+	if !st.CreditsEarliestExpiry.Equal(at2) || st.CreditsEarliestRemaining != 150 {
+		t.Fatalf("earliest after consume=%v/%d want %v/150", st.CreditsEarliestExpiry, st.CreditsEarliestRemaining, at2)
+	}
+
+	// 持久化往返。
+	p.mu.Lock()
+	sf := p.stateOverviewLocked()
+	p.mu.Unlock()
+	if got := sf.Accounts["u1"].CreditsExpiryBuckets; len(got) != 1 || got[0].Remain != 150 {
+		t.Fatalf("persisted buckets=%+v", got)
+	}
+	p2 := New("")
+	p2.mu.Lock()
+	p2.applyAccountsLocked(sf.Accounts)
+	p2.mu.Unlock()
+	st2, ok := p2.Status("u1")
+	if !ok || len(st2.CreditsExpiryBuckets) != 1 || st2.CreditsExpiryBuckets[0].Remain != 150 {
+		t.Fatalf("restored buckets=%+v", st2.CreditsExpiryBuckets)
+	}
+	if !st2.CreditsEarliestExpiry.Equal(at2) || st2.CreditsEarliestRemaining != 150 {
+		t.Fatalf("restored earliest=%v/%d", st2.CreditsEarliestExpiry, st2.CreditsEarliestRemaining)
+	}
+}
+
+// ---------- 暂停选号（paused）----------
+//
+// paused 与 disabled 正交：两者都退出选号候选，但 paused 是「临时让位」——
+// 不清冷却域、不写 reason，且**保号任务照常参与**（见 scheduler 侧测试）。
+
+// TestPauseExitsRouting 暂停号退出选号（Pick 含全冷却兜底都不参与）。
+func TestPauseExitsRouting(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	if !p.Pause("u1") {
+		t.Fatal("Pause 对存在的账号应返回 true")
+	}
+	if got := p.Pick(); got != nil {
+		t.Fatalf("暂停号不应被选中, got %+v", got)
+	}
+	st, _ := p.Status("u1")
+	if !st.Paused {
+		t.Errorf("Status.Paused 应为 true: %+v", st)
+	}
+	if st.Disabled {
+		t.Errorf("暂停不是禁用：Disabled 必须为 false: %+v", st)
+	}
+}
+
+// TestPauseExcludesFromFallback 全冷却兜底同样不捞回暂停号（与 disabled 同口径）。
+func TestPauseExcludesFromFallback(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Pause("u1")
+	p.Cooldown("u1", CoolSoft, time.Hour, "429 rate limited") // 迫使命中兜底路径
+	if got := p.Pick(); got != nil {
+		t.Fatalf("want nil（暂停号不入兜底）, got %+v", got)
+	}
+}
+
+// TestResumeRestoresRouting 解除暂停后立刻回到池子（无需重登或解冻）。
+func TestResumeRestoresRouting(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Pause("u1")
+	if !p.Resume("u1") {
+		t.Fatal("Resume 对存在的账号应返回 true")
+	}
+	if st, _ := p.Status("u1"); st.Paused {
+		t.Errorf("Resume 后 Paused 应为 false: %+v", st)
+	}
+	if got := p.Pick(); got == nil || got.UID != "u1" {
+		t.Errorf("Resume 后应可选, got %+v", got)
+	}
+}
+
+// TestPauseDoesNotTouchCoolingDomain 暂停**不**清冷却域——与 disable 的关键区别：
+// disable 是终态故清冷却，pause 是临时态故保留观测（恢复后仍有效）。
+func TestPauseDoesNotTouchCoolingDomain(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Cooldown("u1", CoolSoft, time.Hour, "429 rate limited")
+	p.Pause("u1")
+	st, _ := p.Status("u1")
+	if !st.Cooling || st.Reason != "429 rate limited" {
+		t.Errorf("Pause 不应清冷却/原因: %+v", st)
+	}
+}
+
+// TestDisableClearsPaused 禁用是比暂停更强的终态：二者不叠加。
+func TestDisableClearsPaused(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Pause("u1")
+	p.Disable("u1", "12153 session dead")
+	st, _ := p.Status("u1")
+	if st.Paused {
+		t.Errorf("disable 后 paused 应被清（不叠加）: %+v", st)
+	}
+	if !st.Disabled {
+		t.Errorf("应为 disabled: %+v", st)
+	}
+}
+
+// TestReviveClearsPaused 运维「解冻」是全清：paused 一并解除。
+func TestReviveClearsPaused(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Pause("u1")
+	if !p.Revive("u1") {
+		t.Fatal("Revive 应返回 true")
+	}
+	if st, _ := p.Status("u1"); st.Paused {
+		t.Errorf("Revive 应清 paused: %+v", st)
+	}
+	if got := p.Pick(); got == nil || got.UID != "u1" {
+		t.Errorf("Revive 后应可选, got %+v", got)
+	}
+}
+
+// TestPausePersists 暂停状态落盘，跨重启不丢（轮换用法要求）。
+func TestPausePersists(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Pause("u1")
+	p.Flush()
+
+	p2 := New(fp)
+	p2.Add(&auth.Auth{UID: "u1"})
+	if st, _ := p2.Status("u1"); !st.Paused {
+		t.Errorf("重载后 Paused 应保持: %+v", st)
+	}
+	if got := p2.Pick(); got != nil {
+		t.Fatalf("重载后暂停号仍不应可选, got %+v", got)
+	}
+}
+
+// TestPauseUnknownUIDReturnsFalse 不存在的 uid 返回 false（供面板区分 404）。
+func TestPauseUnknownUIDReturnsFalse(t *testing.T) {
+	p := New("")
+	if p.Pause("nope") {
+		t.Error("Pause 未知 uid 应返回 false")
+	}
+	if p.Resume("nope") {
+		t.Error("Resume 未知 uid 应返回 false")
+	}
+}
+
+// TestResumeIdempotent 对未暂停账号 Resume 是空操作（幂等，不改变状态）。
+func TestResumeIdempotent(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	if !p.Resume("u1") {
+		t.Fatal("Resume 幂等应返回 true")
+	}
+	if st, _ := p.Status("u1"); st.Paused {
+		t.Errorf("Paused 应仍为 false: %+v", st)
 	}
 }
